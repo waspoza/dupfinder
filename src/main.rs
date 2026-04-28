@@ -82,11 +82,10 @@ fn main() {
                     continue;
                 } // Skip if already moved
 
-                let partial_hash = get_partial_hash(&path).unwrap_or(0);
-                if partial_hash == 0 {
-                    println!("{} == 0", &path.display());
+                let partial_hash = get_partial_hash(&path).unwrap_or_else(|| {
+                    println!("Error getting hash for: {}", &path.display());
                     std::process::exit(1);
-                }
+                });
 
                 if let Some(old_path) = hash_to_original.get(&partial_hash) {
                     let full_hash_new = fs::read(&path).map(|b| xxh3_64(&b)).ok();
@@ -128,6 +127,7 @@ fn main() {
         format_number(dup_size.into_inner())
     );
 }
+
 fn get_partial_hash(path: &std::path::Path) -> Option<u64> {
     let mut file = fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
