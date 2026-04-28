@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use xxhash_rust::xxh3::xxh3_64;
 
 fn main() {
@@ -68,64 +69,63 @@ fn main() {
     // 2. Sort: Biggest file size first
     sorted_groups.sort_by(|a, b| b.0.cmp(&a.0));
 
-    let mut dup_counter = 0;
-    let mut dup_size = 0;
-    for (size, paths) in &sorted_groups {
-        if paths.len() <= 1 || *size == 0 {
-            continue;
-        }
+    let dup_counter = AtomicU64::new(0);
+    let dup_size = AtomicU64::new(0);
 
-        // Key: Hash, Value: The original file we want to keep
-        let mut hash_to_original: HashMap<u64, &PathBuf> = HashMap::new();
+    sorted_groups.into_par_iter().for_each(|(size, paths)| {
+        if paths.len() > 1 && size > 0 {
+            // Key: Hash, Value: The original file we want to keep
+            let mut hash_to_original: HashMap<u64, PathBuf> = HashMap::new();
 
-        for path in paths {
-            if !path.exists() {
-                continue;
-            } // Skip if already moved
+            for path in paths {
+                if !path.exists() {
+                    continue;
+                } // Skip if already moved
 
-            let partial_hash = get_partial_hash(&path).unwrap_or(0);
-            if partial_hash == 0 {
-                println!("{} == 0", &path.display());
-                std::process::exit(1);
-            }
+                let partial_hash = get_partial_hash(&path).unwrap_or(0);
+                if partial_hash == 0 {
+                    println!("{} == 0", &path.display());
+                    std::process::exit(1);
+                }
 
-            if let Some(old_path) = hash_to_original.get(&partial_hash) {
-                let full_hash_new = fs::read(&path).map(|b| xxh3_64(&b)).ok();
-                let full_hash_old = fs::read(old_path).map(|b| xxh3_64(&b)).ok();
-                if full_hash_new.is_some() && full_hash_new == full_hash_old {
-                    println!(
-                        "{} => {}, size: {}",
-                        path.display(),
-                        old_path.display(),
-                        size
-                    );
+                if let Some(old_path) = hash_to_original.get(&partial_hash) {
+                    let full_hash_new = fs::read(&path).map(|b| xxh3_64(&b)).ok();
+                    let full_hash_old = fs::read(old_path).map(|b| xxh3_64(&b)).ok();
+                    if full_hash_new.is_some() && full_hash_new == full_hash_old {
+                        println!(
+                            "{} => {}, size: {}",
+                            path.display(),
+                            old_path.display(),
+                            size
+                        );
 
-                    dup_counter += 1;
-                    dup_size += size;
+                        dup_counter.fetch_add(1, Ordering::Relaxed);
+                        dup_size.fetch_add(size, Ordering::Relaxed);
 
-                    if let Some(ref dest_dir) = dup_dir {
-                        let filename = path.file_name().unwrap();
-                        let dest_file = dest_dir.join(filename);
-                        let _ = std::fs::rename(path, dest_file);
+                        if let Some(ref dest_dir) = dup_dir {
+                            let filename = path.file_name().unwrap();
+                            let dest_file = dest_dir.join(filename);
+                            let _ = std::fs::rename(path, dest_file);
+                        }
+                    } else {
+                        println!(
+                            "❗❗❗Partial hash match, but full hash don't: {} => {}",
+                            &path.display(),
+                            &old_path.display()
+                        );
                     }
                 } else {
-                    println!(
-                        "❗❗❗Partial hash match, but full hash don't: {} => {}",
-                        &path.display(),
-                        &old_path.display()
-                    );
+                    // This is the first time we've seen this hash for THIS size
+                    hash_to_original.insert(partial_hash, path);
                 }
-            } else {
-                // This is the first time we've seen this hash for THIS size
-                hash_to_original.insert(partial_hash, path);
             }
         }
-    }
+    });
     println!(
-        "files: {}, duplicates: {}, dup size: {}",
+        "files: {}, duplicates: {:?}, dup size: {}",
         file_counter,
         dup_counter,
-        format_number(dup_size)
+        format_number(dup_size.into_inner())
     );
 }
 fn get_partial_hash(path: &std::path::Path) -> Option<u64> {
