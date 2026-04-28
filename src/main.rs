@@ -1,4 +1,5 @@
 use jwalk::WalkDir;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek};
@@ -67,36 +68,56 @@ fn main() {
     // 2. Sort: Biggest file size first
     sorted_groups.sort_by(|a, b| b.0.cmp(&a.0));
 
-    let mut dup_db: HashMap<u64, &PathBuf> = HashMap::new();
     let mut dup_counter = 0;
     let mut dup_size = 0;
     for (size, paths) in &sorted_groups {
-        if paths.len() > 1 && *size > 0 {
-            for path in paths {
-                //let hash = fs::read(&path).map(|bytes| xxh3_64(&bytes)).unwrap_or(0);
-                let hash = get_partial_hash(&path).unwrap_or(0);
-                if let Some(old_path) = dup_db.insert(hash, &path) {
+        if paths.len() <= 1 || *size == 0 {
+            continue;
+        }
+
+        // Key: Hash, Value: The original file we want to keep
+        let mut hash_to_original: HashMap<u64, &PathBuf> = HashMap::new();
+
+        for path in paths {
+            if !path.exists() {
+                continue;
+            } // Skip if already moved
+
+            let partial_hash = get_partial_hash(&path).unwrap_or(0);
+            if partial_hash == 0 {
+                println!("{} == 0", &path.display());
+                std::process::exit(1);
+            }
+
+            if let Some(old_path) = hash_to_original.get(&partial_hash) {
+                let full_hash_new = fs::read(&path).map(|b| xxh3_64(&b)).ok();
+                let full_hash_old = fs::read(old_path).map(|b| xxh3_64(&b)).ok();
+                if full_hash_new.is_some() && full_hash_new == full_hash_old {
                     println!(
                         "{} => {}, size: {}",
                         path.display(),
                         old_path.display(),
                         size
                     );
+
                     dup_counter += 1;
                     dup_size += size;
+
                     if let Some(ref dest_dir) = dup_dir {
                         let filename = path.file_name().unwrap();
                         let dest_file = dest_dir.join(filename);
-                        if let Err(e) = std::fs::rename(path, &dest_file) {
-                            println!(
-                                "Error moving {} to {}: {}",
-                                path.display(),
-                                dest_file.display(),
-                                e
-                            )
-                        }
+                        let _ = std::fs::rename(path, dest_file);
                     }
+                } else {
+                    println!(
+                        "❗❗❗Partial hash match, but full hash don't: {} => {}",
+                        &path.display(),
+                        &old_path.display()
+                    );
                 }
+            } else {
+                // This is the first time we've seen this hash for THIS size
+                hash_to_original.insert(partial_hash, path);
             }
         }
     }
@@ -109,26 +130,31 @@ fn main() {
 }
 fn get_partial_hash(path: &std::path::Path) -> Option<u64> {
     let mut file = fs::File::open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    let len = metadata.len();
+    let len = file.metadata().ok()?.len();
+    let mut hash_accumulator = 0u64;
 
-    // Buffer for our samples
-    let mut buffer = [0u8; 16384]; // 16KB
-
-    // 1. Read the beginning
-    file.read_exact(&mut buffer).ok()?;
-    let mut hash = xxh3_64(&buffer);
-
-    // 2. Read the end (if the file is big enough)
-    if len > 32768 {
-        file.seek(std::io::SeekFrom::End(-16384)).ok()?;
-        file.read_exact(&mut buffer).ok()?;
-        // Mix the end hash into the beginning hash
-        hash ^= xxh3_64(&buffer);
+    // If file is smaller than 32KB, just hash the whole thing
+    if len <= 32768 {
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).ok()?;
+        return Some(xxh3_64(&buf));
     }
 
-    Some(hash)
+    // For big files, sample the start and end
+    let mut buffer = [0u8; 16384];
+
+    // Read start
+    file.read_exact(&mut buffer).ok()?;
+    hash_accumulator ^= xxh3_64(&buffer);
+
+    // Read end
+    file.seek(std::io::SeekFrom::End(-16384)).ok()?;
+    file.read_exact(&mut buffer).ok()?;
+    hash_accumulator ^= xxh3_64(&buffer);
+
+    Some(hash_accumulator)
 }
+
 fn format_number(n: u64) -> String {
     let s = n.to_string();
     s.as_bytes()
