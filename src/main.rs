@@ -156,6 +156,9 @@ fn get_partial_hash(path: &std::path::Path) -> Option<u64> {
 }
 
 fn format_number(n: u64) -> String {
+    // Formats a u64 into a human-readable string with comma separators.
+    // Digits are grouped in triples (thousands, millions, billions, …) from right to
+    // left and joined with commas — e.g. 1_000_000 becomes "1,000,000".
     let s = n.to_string();
     s.as_bytes()
         .rchunks(3)
